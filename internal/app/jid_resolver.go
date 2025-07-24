@@ -16,9 +16,10 @@ type Resolver struct {
 	userJID   types.JID
 	groupJID  *types.JID
 
-	ready   bool
-	mu      sync.RWMutex
-	onReady func()
+	ready     bool
+	mu        sync.RWMutex
+	onReady   func()
+	matchChan chan entity.Message
 }
 
 func NewResolver(groupName string, userJID types.JID, onReady func()) *Resolver {
@@ -26,6 +27,7 @@ func NewResolver(groupName string, userJID types.JID, onReady func()) *Resolver 
 		groupName: strings.ToLower(groupName),
 		userJID:   userJID,
 		onReady:   onReady,
+		matchChan: make(chan entity.Message, 100),
 	}
 }
 
@@ -40,6 +42,10 @@ func (r *Resolver) ResolveGroup(ctx context.Context, groupJID types.JID, actualN
 	if r.onReady != nil {
 		go r.onReady()
 	}
+}
+
+func (r *Resolver) MatchChan() <-chan entity.Message {
+	return r.matchChan
 }
 
 func (r *Resolver) Hit(msg entity.Message) bool {

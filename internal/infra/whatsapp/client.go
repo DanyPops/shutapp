@@ -6,7 +6,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
@@ -26,8 +25,6 @@ type Client struct {
 	targetJID types.JID
 	eventSubs []func(entity.Message)
 	delMu     sync.Mutex
-	lastDel   time.Time
-	delay     time.Duration
 }
 
 // NewClient opens/creates an SQLite store and initializes the whatsmeow client.
@@ -48,7 +45,6 @@ func NewClient(ctx context.Context, dbPath string, logLevel string) (*Client, er
 
 	c := &Client{
 		wc:    wc,
-		delay: 1 * time.Second,
 	}
 
 	wc.AddEventHandler(c.handleEvent)
@@ -195,15 +191,6 @@ func (c *Client) ResolveGroupByName(ctx context.Context, name string) (*types.JI
 // Revoke tries to delete a message for everyone. WhatsApp enforces a time window; may fail.
 // BuildRevoke is preferred over deprecated RevokeMessage.
 func (c *Client) Revoke(ctx context.Context, chat types.JID, msgID string) error {
-	// throttle
-	c.delMu.Lock()
-	since := time.Since(c.lastDel)
-	if since < c.delay {
-		time.Sleep(c.delay - since)
-	}
-	c.lastDel = time.Now()
-	c.delMu.Unlock()
-
 	// Build and send revoke message
 	msg := c.wc.BuildRevoke(chat, c.targetJID, types.MessageID(msgID))
 	_, err := c.wc.SendMessage(ctx, chat, msg)

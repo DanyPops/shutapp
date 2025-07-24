@@ -74,5 +74,8 @@ func main() {
 	l := iface.NewListener(ctx, client, resolver)
 	_ = l.Start()
 
+	// Batch Deleter
+	iface.StartBatchDeleter(ctx, client, resolver.MatchChan())
+
 	select {}
 }
