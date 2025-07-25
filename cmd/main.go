@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -16,24 +15,24 @@ import (
 func main() {
 	ctx := context.Background()
 
-	// Load config
+	// Load configuration
 	cfg, err := app.LoadTargetConfig("target.yaml")
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
 
-	// Init WA client
+	// Init WhatsApp client
 	client, err := whatsapp.NewClient(ctx, "session.db", "info")
 	if err != nil {
 		log.Fatalf("wa client: %v", err)
 	}
 
-	// Connect (handles QR automatically)
+	// Connect WhatsApp client (handles QR automatically)
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("connect: %v", err)
 	}
 
-	// Resolve self JID
+	// Resolve target JID
 	var userPNJID *types.JID
 
 	const maxWait = 15 * time.Second
@@ -45,30 +44,30 @@ func main() {
 		if err == nil {
 			break
 		}
+
 		if time.Since(start) > maxWait {
 			log.Fatalf("resolve target phone (after retries): %v", err)
 		}
 		log.Println("🔄 Waiting for contact sync...")
+
 		time.Sleep(interval)
 	}
-	fmt.Println("Expecting userJID:", userPNJID.String())
 
 	// Resolve target JID (formerly in NewClient)
 	jid := types.NewJID(strings.TrimPrefix(cfg.Phone, "+"), types.DefaultUserServer)
 	client.SetTargetJID(jid)
 
 	// Resolve group
-	gjid, actual, err := client.ResolveGroupByName(ctx, cfg.Group)
+	gjid, err := client.ResolveGroupByName(ctx, cfg.Group)
 	if err != nil {
 		log.Fatalf("resolve group: %v", err)
 	}
-	fmt.Printf("Resolved group %q -> %s\n", actual, gjid.String())
 
 	// Resolver
-	resolver := app.NewResolver(actual, *userPNJID, func() {
-		log.Println("🟢 Target ready; deletions active.")
-	})
-	resolver.ResolveGroup(ctx, *gjid, actual)
+	resolver := app.NewResolver(
+		*userPNJID,
+	)
+	resolver.ResolveGroup(ctx, *gjid)
 
 	// Listener
 	l := iface.NewListener(ctx, client, resolver)

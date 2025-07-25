@@ -3,9 +3,10 @@ package whatsapp
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strings"
-	"sync"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
@@ -21,10 +22,10 @@ import (
 
 // Client wraps whatsmeow.Client with our app-facing methods.
 type Client struct {
-	wc        *whatsmeow.Client
-	targetJID types.JID
-	eventSubs []func(entity.Message)
-	delMu     sync.Mutex
+	wc              *whatsmeow.Client
+	targetJID       types.JID
+	eventSubs       []func(entity.Message)
+	addedMsgHandler bool
 }
 
 // NewClient opens/creates an SQLite store and initializes the whatsmeow client.
@@ -44,7 +45,7 @@ func NewClient(ctx context.Context, dbPath string, logLevel string) (*Client, er
 	wc := whatsmeow.NewClient(deviceStore, clientLog)
 
 	c := &Client{
-		wc:    wc,
+		wc: wc,
 	}
 
 	wc.AddEventHandler(c.handleEvent)
@@ -69,7 +70,7 @@ func (c *Client) Connect(ctx context.Context) error {
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 				// Using Stdout by default; writer param omitted to fallback to Stdout
 			} else {
-				fmt.Println("Login event:", evt.Event)
+				log.Println("Login event:", evt.Event)
 			}
 			if evt.Event == "success" || evt.Event == "timeout" {
 				break
@@ -78,7 +79,6 @@ func (c *Client) Connect(ctx context.Context) error {
 		return nil
 	}
 
-	// Existing session
 	return c.wc.Connect()
 }
 
@@ -89,25 +89,26 @@ func (c *Client) Disconnect() {
 
 // Subscribe to incoming messages
 func (c *Client) AddMessageHandler(fn func(entity.Message)) {
+	if c.addedMsgHandler {
+		return
+	}
 	c.eventSubs = append(c.eventSubs, fn)
+	c.addedMsgHandler = true
 }
 
-// handleEvent is registered with whatsmeow.Client.
 func (c *Client) handleEvent(evt any) {
 	switch v := evt.(type) {
 	case *events.Message:
 		info := v.Info
 		msg := v.Message
-		fmt.Printf("Incoming: chat=%s sender=%s msgID=%s\n", info.Chat.String(), info.Sender.String(), info.ID)
 
-		// 🧠 Attempt to resolve sender JID to phone number (PN)
 		resolvedSender := info.Sender.String()
 		pn, err := c.ResolvePN(context.Background(), info.Sender)
 		if err == nil {
-			fmt.Printf("🔍 Resolved sender %s → %s\n", info.Sender.String(), pn.String())
+			log.Printf("🔍 Resolved sender %s → %s\n", info.Sender.String(), pn.String())
 			resolvedSender = pn.String()
 		} else {
-			fmt.Printf("⚠️  Could not resolve LID to PN: %v\n", err)
+			log.Printf("⚠️  Could not resolve LID to PN: %v\n", err)
 		}
 
 		var text string
@@ -129,20 +130,29 @@ func (c *Client) handleEvent(evt any) {
 		}
 
 	case *events.HistorySync:
-		fmt.Println("📦 Processing history sync...")
+		log.Println("📦 Processing history sync...")
 
 		hs := v.Data // *waHistorySync.HistorySyncData
 
 		for _, chat := range hs.Conversations {
 			for _, historyMsg := range chat.Messages { // historyMsg is *waHistorySync.HistorySyncMsg
 				msg := historyMsg.GetMessage()
-				if msg == nil || msg.GetKey() == nil || msg.GetMessage() == nil {
+				if msg == nil || msg.GetKey() == nil {
 					continue
 				}
 
 				key := msg.GetKey()
 				chatJID := key.GetRemoteJID()
-				senderJID := key.GetParticipant()
+
+				var senderJID string
+				if msg.Participant != nil {
+					senderJID = *msg.Participant
+				} else if key.Participant != nil {
+					senderJID = *key.Participant
+				} else {
+					senderJID = ""
+				}
+
 				msgID := key.GetID()
 				message := msg.GetMessage()
 
@@ -173,19 +183,20 @@ func (c *Client) handleEvent(evt any) {
 
 // ResolveGroupByName searches the synced chat store for a subject containing (case-insensitive) the given name.
 // Returns the first match. Improve w/ exact matching or config.
-func (c *Client) ResolveGroupByName(ctx context.Context, name string) (*types.JID, string, error) {
+func (c *Client) ResolveGroupByName(ctx context.Context, name string) (*types.JID, error) {
 	groups, err := c.wc.GetJoinedGroups()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
+
 	lname := strings.ToLower(name)
 	for _, group := range groups {
 		if strings.ToLower(group.Name) == lname || strings.Contains(strings.ToLower(group.Name), lname) {
 			jid := group.JID
-			return &jid, group.Name, nil
+			return &jid, nil
 		}
 	}
-	return nil, "", fmt.Errorf("group %q not found", name)
+	return nil, fmt.Errorf("group %q not found", name)
 }
 
 // Revoke tries to delete a message for everyone. WhatsApp enforces a time window; may fail.
@@ -203,18 +214,45 @@ func (c *Client) Raw() *whatsmeow.Client { return c.wc }
 // ResolveUserByPhone scans synced contacts for a JID matching the given phone number.
 // It returns the first match (usually fine for personal usage).
 func (c *Client) ResolveUserByPhone(ctx context.Context, phone string) (*types.JID, error) {
-	contacts, err := c.wc.Store.Contacts.GetAllContacts(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get contacts: %w", err)
-	}
-
 	phone = strings.TrimPrefix(phone, "+")
-	for jid := range contacts {
-		if jid.User == phone || strings.Contains(jid.User, phone) {
-			return &jid, nil
+	jid := types.NewJID(phone, types.DefaultUserServer)
+
+	timeout := time.After(15 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timeout:
+			return nil, fmt.Errorf("resolve target phone (after retries): no WhatsApp JID found for phone: %s", phone)
+		case <-ticker.C:
+			// First try resolving via LID store
+			lid, err := c.wc.Store.LIDs.GetLIDForPN(ctx, jid)
+			if err == nil && !lid.IsEmpty() {
+				// ✅ Now resolve the JID back from the LID
+				jid, err := c.wc.Store.LIDs.GetPNForLID(ctx, lid)
+				if err == nil && !jid.IsEmpty() {
+					log.Printf("✅ Resolved phone %s via LID→PN mapping: %s", phone, jid.String())
+					return &jid, nil
+				}
+			}
+
+			// Fallback: try contact list
+			contacts, err := c.wc.Store.Contacts.GetAllContacts(ctx)
+			if err == nil {
+				for cjid := range contacts {
+					if cjid.User == phone {
+						log.Printf("✅ Resolved phone %s via contact store: %s", phone, cjid.String())
+						return &cjid, nil
+					}
+				}
+			}
+
+			log.Printf("🔄 Waiting for contact or LID sync for phone: %s", phone)
 		}
 	}
-	return nil, fmt.Errorf("no WhatsApp JID found for phone: %s", phone)
 }
 
 func (c *Client) ResolvePN(ctx context.Context, lid types.JID) (types.JID, error) {

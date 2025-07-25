@@ -45,7 +45,7 @@ func StartBatchDeleter(ctx context.Context, rc RevokeClient, matches <-chan enti
 					} else {
 						log.Printf("✅ Revoked: %s", m.ID)
 					}
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(50 * time.Millisecond)
 				}
 			}
 		}
